@@ -7,6 +7,7 @@ from utils import load_custom_css
 from uuid import uuid4
 from streamlit_local_storage import LocalStorage # type: ignore
 from google.oauth2 import service_account
+import json
 
 # Browser's local storage
 localS = LocalStorage()
@@ -19,32 +20,50 @@ def main():
 
 	st.html(load_custom_css())
 
-  # Initialize Vertex AI with service account credentials
-	credentials = service_account.Credentials.from_service_account_info(
-		st.secrets["gcp_service_account"]
-	)
+	# Get GCP credentials from Streamlit secrets or local storage
+	# If not found, prompt the user to enter it
+	credentials_source = "environment"
+	service_account_info = None
+	location = None
+	resource_id = None
+
+	try:
+		# Try to get from Streamlit secrets first
+		service_account_info = st.secrets["gcp_service_account"]
+		location = st.secrets["LOCATION"]
+		resource_id = st.secrets["RESOURCE_ID"]
+	except (KeyError):
+		# Fall back to local storage
+		gcp_credentials_str = localS.getItem("gcp_credentials")
+		if gcp_credentials_str:
+			try:
+				gcp_credentials = json.loads(gcp_credentials_str)
+				service_account_info = gcp_credentials.get("service_account_info")
+				location = gcp_credentials.get("location")
+				resource_id = gcp_credentials.get("resource_id")
+				credentials_source = "local_storage"
+			except json.JSONDecodeError as error:
+				gcp_credentials_dialog(f"Invalid credentials data: {error}")
+	
+	if not service_account_info or not location or not resource_id:
+		gcp_credentials_dialog()
+
+	# Initialize Vertex AI with service account credentials
+	try:
+		credentials = service_account.Credentials.from_service_account_info(service_account_info)
+	except Exception as e:
+		gcp_credentials_dialog(f"Invalid service account credentials: {e}")
 
 	vertexai.init(
 		credentials=credentials,
-		project=os.getenv("PROJECT_ID"),
-		location=os.getenv("LOCATION_ID"),
+		project=service_account_info["project_id"],
+		location=location,
 	)
-
-  # Get the Agent Engine resource ID from environment variable or local storage
-	# If not found, prompt the user to enter it
-	resource_id_is_from_local_storage = False
-	resource_id = os.getenv("RESOURCE_ID")
-	if not resource_id:
-		resource_id = localS.getItem("agent_engine_resource_id")
-		resource_id_is_from_local_storage = True
-
-	if not resource_id:
-		agent_engine_resource_id_dialog()
 
 	try:
 		engine = agent_engines.get(resource_id)
 	except Exception as e:
-		agent_engine_resource_id_dialog(e)
+		gcp_credentials_dialog(e)
 
 	user_id = localS.getItem("user_id")
 	if not user_id:
@@ -72,13 +91,13 @@ def main():
 	# Sidebar logic
 	st.sidebar.header(f"_***{os.getenv('CHATBOT_NAME', constants.DEFAULT_CHATBOT_NAME)}***_", divider="rainbow")
 
-	if resource_id_is_from_local_storage:
-		if st.sidebar.button(
-			f"{constants.ROBOT_ICON} Change Resource ID",
+	if credentials_source == "local_storage":
+		st.sidebar.button(
+			f"{constants.ROBOT_ICON} Change Credentials",
 			key="change_resource_id_btn",
-			help="Change the Agent Engine resource ID"
-		):
-			agent_engine_resource_id_dialog()
+			help="Change the GCP credentials",
+			on_click=gcp_credentials_dialog
+		)
 
 	show_tool_calls = st.sidebar.toggle(
 		"Show Function Calls",
@@ -196,22 +215,129 @@ def get_user_sessions(_engine: agent_engines.AgentEngine, user_id: str) -> list:
 	"""
 	return _engine.list_sessions(user_id=user_id)['sessions']
 
-@st.dialog("Enter your Agent Engine's resource ID")
-def agent_engine_resource_id_dialog(error=None):
+@st.dialog("Enter your Agent's GCP credentials", width="large")
+def gcp_credentials_dialog(error=None):
+	how_to_get_credentials()
 	if error:
 		st.error(f"Error retrieving agent engine: {error}")
 
-	resource_id = st.text_input(
-		label="Resource ID",
-		value=localS.getItem("agent_engine_resource_id")
-	)
-	
-	if st.button("Retrieve"):
-		localS.setItem("agent_engine_resource_id", resource_id)
-		st.success("Resource ID saved!")
-		st.rerun()
-	else:
-		st.stop()
+	# Try to get existing credentials from local storage
+	existing_credentials = {}
+	gcp_credentials_str = localS.getItem("gcp_credentials")
+	if gcp_credentials_str:
+		try:
+			existing_credentials = json.loads(gcp_credentials_str)
+		except json.JSONDecodeError:
+			pass
+
+	with st.form("agent_engine_resource_form"):
+		location = st.text_input(
+			label="Location",
+			value=os.getenv("LOCATION") or existing_credentials.get("location", "us-central1"),
+			placeholder="us-central1"
+		)
+
+		resource_id = st.text_input(
+			label="Resource ID",
+			value=existing_credentials.get("resource_id", ""),
+		)
+
+		service_account_json = st.file_uploader(
+			label="Upload service account JSON file",
+			type=["json"],
+			help="""
+				Upload your GCP service account JSON file to authenticate with Vertex AI.
+				The contents of this file will only be stored in your browser's local storage.
+			""",
+			key="service_account_uploader",
+		)
+
+		submitted = st.form_submit_button("Submit")
+
+
+		if submitted:
+			if not resource_id:
+				st.error("Resource ID is required.")
+				return
+
+			if not location:
+				st.error("Location is required.")
+				return
+
+			if service_account_json is None:
+				st.error("Service account JSON file is required.")
+				return
+
+			# Parse the service account JSON
+			try:
+				service_account_info = json.loads(service_account_json.read().decode('utf-8'))
+			except json.JSONDecodeError as e:
+				st.error(f"Invalid JSON file: {e}")
+				return
+
+			# Build credentials dictionary
+			gcp_credentials = {
+				"location": location,
+				"resource_id": resource_id,
+				"service_account_info": service_account_info
+			}
+
+			# Store as single JSON string in local storage
+			localS.setItem("gcp_credentials", json.dumps(gcp_credentials), key="set_gcp_credentials")
+
+			st.success("GCP credentials saved successfully!")
+			st.rerun()
+		else:
+			st.stop()
+
+
+def how_to_get_credentials():
+    with st.expander("How to get your credentials"):
+        st.markdown(
+            """
+            To connect to your Vertex AI Agent, you need three pieces of information:
+            1.  **Location**: The GCP region where your agent is deployed (e.g., `us-central1`).
+            2.  **Resource ID**: The unique identifier for your agent.
+            3.  **Service Account JSON**: A key file to authenticate with Google Cloud.
+
+            ---
+
+            #### 1. Finding your Location and Resource ID
+            - Navigate to your agent in the [Vertex AI Agent Engine](https://console.cloud.google.com/vertex-ai/agents/agent-engines).
+            - Select your agent.
+            - Your **Location** and **Resource ID** can be found in your browser's URL. For example:
+              `.../locations/us-central1/agent-engines/1234567891059626240`
+              - **Location**: `us-central1`
+              - **Resource ID**: `1234567891059626240`
+
+            ---
+
+            #### 2. Creating a Service Account and JSON Key
+            You need to grant this application permission to access your agent.
+
+            **Step 1: Go to the Service Accounts page**
+            - Go to the [Service Accounts page](https://console.cloud.google.com/iam-admin/serviceaccounts) in the Google Cloud Console.
+            - Make sure you have selected the correct project.
+
+            **Step 2: Create the Service Account**
+            - Click **+ CREATE SERVICE ACCOUNT**.
+            - Give it a name (e.g., `adk-chatbot-service-account`) and an optional description.
+            - Click **CREATE AND CONTINUE**.
+
+            **Step 3: Grant Permissions**
+            - In the "Grant this service account access to project" section, click the **Role** dropdown.
+            - Search for and select the **Vertex AI User** role.
+            - Click **CONTINUE**, then **DONE**.
+
+            **Step 4: Create and Download the JSON Key**
+            - Find your new service account in the list.
+            - Click the three-dot menu (⋮) on the right and select **Manage keys**.
+            - Click **ADD KEY** → **Create new key**.
+            - Select **JSON** as the key type and click **CREATE**.
+            - A JSON file will be downloaded. **This is the file you need to upload above.**
+            """
+        )
+
 
 if __name__ == "__main__":
 	main()
